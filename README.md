@@ -86,7 +86,11 @@ jupyter notebook ol_report.ipynb
 
 ## References
 
-- Goodfellow, I., Bengio, Y., & Courville, A. (2016). *Deep Learning*. MIT Press.
 - Kingma, D. P. & Ba, J. (2015). Adam: A Method for Stochastic Optimization. *ICLR*.
 - Loshchilov, I. & Hutter, F. (2019). Decoupled Weight Decay Regularization. *ICLR*.
-- Srivastava, N. et al. (2014). Dropout: A Simple Way to Prevent Neural Networks from Overfitting. *JMLR*.
+- Srivastava, N. et al. (2014). Dropout: A Simple Way to Prevent Neural Networks from Overfitting. *JMLR*, 15(56), 1929–1958.
+- Kirkpatrick, S., Gelatt, C. D. & Vecchi, M. P. (1983). Optimization by Simulated Annealing. *Science*, 220(4598), 671–680.
+- Mitchell, M. (1998). *An Introduction to Genetic Algorithms*. MIT Press.
+- Müller, R., Kornblith, S. & Hinton, G. E. (2019). When Does Label Smoothing Help? *NeurIPS*, 32.
+- Becker, B. & Kohavi, R. (1996). Adult Income Dataset. UCI Machine Learning Repository.
+- Cortez, P. et al. (2009). Wine Quality Dataset. UCI Machine Learning Repository.
