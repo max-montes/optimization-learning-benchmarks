@@ -1,0 +1,344 @@
+\documentclass[10 pt, twocolumn]{article} 
+
+\usepackage[margin=0.75in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{caption}
+\usepackage[numbers]{natbib}
+\usepackage{enumitem}
+
+\setlength{\columnsep}{0.25in}
+\captionsetup{font=small, labelfont=bf}
+
+\title{\LARGE \bf
+Optimization \& Uncertainty in Learning Report
+}
+
+%\author{ \parbox{3 in}{\centering Huibert Kwakernaak*
+%         \thanks{*Use the $\backslash$thanks command to put information here}\\
+%         Faculty of Electrical Engineering, Mathematics and Computer Science\\
+%         University of Twente\\
+%         7500 AE Enschede, The Netherlands\\
+%         {\tt\small h.kwakernaak@autsubmit.com}}
+%         \hspace*{ 0.5 in}
+%         \parbox{3 in}{ \centering Pradeep Misra**
+%         \thanks{**The footnote marks may be inserted manually}\\
+%        Department of Electrical Engineering \\
+%         Wright State University\\
+%         Dayton, OH 45435, USA\\
+%         {\tt\small pmisra@cs.wright.edu}}
+%}
+
+\author{Max Montes Soza \\
+\textit{Georgia Tech Institute} \\
+msoza3@gatech.edu% <-this % stops a space
+}
+
+
+\begin{document}
+
+
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+\section{Introduction}
+
+Modern neural network training involves far more than choosing an architecture: the optimizer, its hyperparameters and the regularization strategy each shape convergence speed, stability, and generalization in ways that are difficult to predict from first principles alone. This report treats the two-hidden-layer MLPs finalized in the Supervised Learning (SL) Report as fixed backbones and systematically investigates three forces that influence training outcomes.
+
+First, we apply randomized optimization (RO) algorithms---Randomized Hill Climbing (RHC), Simulated Annealing (SA)~\cite{kirkpatrick1983optimization}, and a Genetic Algorithm (GA)~\cite{mitchell1998introduction}---to the last few layers of both networks under a strict parameter budget, asking whether derivative-free search can escape local minima that gradient descent may have settled into. Second, we ablate the components of Adam~\cite{kingma2015adam} on the Adult dataset, isolating the contributions of momentum, adaptive scaling, bias correction, and decoupled weight decay~\cite{loshchilov2019decoupled} to convergence speed and stability. Third, we run a controlled regularization study on Adult using the best Adam configuration from Part~2, quantifying how L2 decay, early stopping, dropout, and noise regularization each move the test metric.
+
+\section{Data \& Methodology}
+
+\subsection{Datasets and Preprocessing}
+
+We reuse the same two datasets and preprocessing pipeline from the SL Report.
+
+\textbf{Adult Income (Census Income).} Binary classification ($N = 45{,}222$) predicting whether annual income exceeds \$50K. The dataset contains 6 continuous features (age, hours-per-week, capital-gain/loss, education-num, fnlwgt) and 8 categorical features (workclass, education, marital-status, occupation, relationship, race, sex, native-country). After one-hot encoding of categorical features and standard scaling of continuous features (fit on training data only), the input dimensionality is 104. The target exhibits a 3.03:1 class imbalance (75.1\% $\leq$50K, 24.9\% $>$50K). No missing values remain after dropping rows with ``?'' entries. We report both accuracy and F1 score, with F1 as the primary metric to account for imbalance~\cite{adult_dataset}.
+
+\textbf{Wine Quality (Red + White).} Multiclass classification ($N = 6{,}497$) predicting a discrete quality rating. All 12 input features are continuous physicochemical measurements (fixed/volatile acidity, citric acid, residual sugar, chlorides, free/total sulfur dioxide, density, pH, sulphates, alcohol, plus a binary red/white indicator). After standard scaling, the input dimensionality is 12 with 8 target classes (quality levels 1--8, remapped to 0--7). The class distribution is heavily imbalanced: quality levels 5 and 6 account for $>$70\% of samples, while quality levels 1, 2, and 8 each have $<$1\%. No missing values are present~\cite{wine_dataset}. We report accuracy and Macro-F1, with Macro-F1 as the primary metric.
+
+Both datasets use an 80/20 stratified train/test split (seed 42), with the training set further split 85/15 for train/validation, yielding: Adult 30{,}750/5{,}427/9{,}045 and Wine 4{,}417/780/1{,}300 (train/val/test). All preprocessing is fit on the training fold only and applied to validation and test folds to prevent leakage. EDA, preprocessing, and splits are identical to the SL Report; no material changes were made.
+
+\textbf{Sanity check.} As a verification that the models learn genuine patterns, we trained both backbones on randomly shuffled labels. Adult accuracy degraded from 0.8511 to 0.7521 (majority-class prediction) with F1 collapsing to 0.0000. Wine accuracy dropped from 0.5646 to 0.3462 with Macro-F1 falling to 0.0643, near the random-chance floor of $1/8 = 0.125$.
+
+\subsection{Baseline Architecture}
+
+Both backbones are two-hidden-layer MLPs implemented in PyTorch with ReLU activations and 20\% dropout~\cite{srivastava2014dropout}:
+\begin{itemize}
+    \item \textbf{Adult:} [200, 200] hidden units, 1 output neuron (BCEWithLogitsLoss), 61{,}401 parameters.
+    \item \textbf{Wine:} [128, 128] hidden units, 8 output neurons (CrossEntropyLoss), 19{,}208 parameters.
+\end{itemize}
+The SL Report trained both with SGD (no momentum), learning rate 0.01, weight decay $10^{-4}$, and early stopping with patience 15. Reproduced SL baselines: Adult Acc 0.8511, F1 0.6725; Wine Acc 0.5646, Macro-F1 0.3198. 
+
+\subsection{Compute Budgets and Accounting}
+
+All experiments run on Apple Silicon (CPU). We track three cost metrics: (1)~\textbf{gradient evaluations}: one per mini-batch backward pass; (2)~\textbf{function evaluations}: one per full-dataset forward pass used by RO to assess a candidate solution; (3)~\textbf{wall-clock time} on the same hardware. Batch size is 256 for Adult and 128 for Wine unless otherwise stated. Five random seeds (42, 123, 456, 789, 1024) are used throughout for stability assessment, with results reported as median and interquartile range (IQR) unless noted.
+
+% ============================================================
+\section{Hypotheses}
+
+\textbf{H1 (Both datasets---RO).} RO methods will struggle to match gradient-based training within reasonable evaluation budgets because the loss surfaces have $>$40{,}000 trainable parameters even after freezing. SA may show early improvements by accepting uphill moves, but GA's per-generation cost (population $\times$ evaluations) will limit its search depth. Neither dataset's RO results will exceed the SL baseline test performance, though SA may approach it on Adult if the step-size schedule is well-tuned.
+
+\textbf{H2 (Adult---Optimizer Ablation).} Adam will converge to the validation-loss threshold $\ell$ in fewer gradient evaluations than SGD, primarily due to per-parameter adaptive scaling (second moment). Removing bias correction will slow early-epoch convergence but have negligible effect after 20+ epochs. Momentum alone (SGD+Momentum) will close most of the gap with Adam, suggesting that the first moment is the dominant ingredient on this dataset. However, we predict that Adam variants will exhibit a wider generalization gap (train accuracy $-$ test accuracy) than SGD, because fast convergence on a noisy, imbalanced dataset may encourage overfitting to the majority class. The SL baseline (SGD, Acc 0.8507, F1 0.6726) may therefore remain competitive with Adam in final test F1.
+
+\textbf{H3 (Adult---Regularization).} Given Adam's tendency toward sharper minima, explicit regularization will yield a larger test-F1 improvement than optimizer choice alone. Among techniques, dropout will be the strongest single regularizer because it disrupts co-adapted features in the hidden layers, while noise regularization (label smoothing~\cite{muller2019trivializing}) will have a modest positive effect by softening the loss surface. The best combination will improve Adult test F1 above the SL baseline.
+
+% ============================================================
+
+\section{Part 1: Randomized Optimization}
+
+\subsection{Setup}
+
+We freeze all but the last two layers of each backbone, yielding 40{,}401 trainable parameters for Adult and 17{,}544 for Wine (both under the 50k cap). Each RO algorithm starts from the SGD-trained baseline weights and optimizes the validation loss via direct weight perturbation with 2{,}000 function evaluations per run and 3 random seeds.
+
+\textbf{RHC:} Gaussian perturbation ($\sigma = 0.01$), 5 restarts with random re-initialization from best-known weights, plateau limit of 200 evaluations without improvement. \textbf{SA:} Initial temperature $T_0 = 5 \times 10^{-4}$ (calibrated to loss-change scale), geometric decay $T_{t+1} = 0.995 \cdot T_t$, Gaussian perturbation ($\sigma = 0.01$). \textbf{GA:} Population 20, tournament selection ($k=3$), uniform crossover (rate 0.7), Gaussian mutation (rate 0.1, $\sigma = 0.01$), elitism 2.
+
+\subsection{Results}
+
+Figure~\ref{fig:roprogress} shows best-so-far validation loss vs.\ function evaluations for both datasets. On Adult, all three methods plateau quickly, with GA achieving the highest test F1 (0.6758) marginally above the SL baseline (0.6726). On Wine, SA produced the best Macro-F1 (0.3395) above the baseline (0.3085), while RHC and GA also improved over baseline.
+
+\begin{figure*}[!htbp]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/part1_ro_progress.png}
+    \caption{RO progress curves (best-so-far val loss vs.\ function evaluations). Left: Adult (RHC: 5 restarts, $\sigma{=}0.01$; SA: $T_0{=}1.0$, decay$=$0.995; GA: pop$=$20, elitism$=$2). Right: Wine (same settings). Faint lines show individual seeds.}
+    \label{fig:roprogress}
+\end{figure*}
+
+\subsection{Discussion}
+
+H1 is partially refuted. We predicted RO would not exceed SL baseline performance, yet GA on Adult (F1 = 0.6758 vs.\ 0.6726) and SA on Wine (Macro-F1 = 0.3395 vs.\ 0.3085) both produced improvements. The modest gains on Adult ($+$0.5\% F1) are within noise, but Wine's $+$10\% Macro-F1 gain is notable and suggests that the SGD-trained Wine model was stuck in a suboptimal region for the minority classes, which SA's temperature-driven exploration helped escape.
+
+Computationally, each RO run consumed 2{,}000 function evaluations in $\sim$5~s (Adult) and $\sim$0.7~s (Wine). For comparison, the SGD baseline used $\sim$12{,}000 gradient evaluations in $\sim$15~s. However, RO function evaluations and gradient evaluations are not directly comparable: each gradient evaluation includes both a forward and backward pass, while each function evaluation is a forward pass only. The effective compute per RO evaluation is roughly half that of a gradient evaluation.
+
+GA's elitism and crossover operators stabilized the search on Adult, preventing the catastrophic forgetting that can occur when RHC accepts a large perturbation. SA's calibrated temperature schedule ($T_0 = 5 \times 10^{-4}$, yielding ${\sim}50\%$ initial acceptance) proved most effective on Wine, where its controlled exploration of uphill moves helped escape the majority-class basin that trapped greedy methods. On Adult, SA underperformed (F1 = 0.6677), likely because the Adult loss surface is smoother and the baseline already near-optimal, leaving less room for stochastic exploration to help.
+
+\textbf{Confusion matrices.} Figure~\ref{Figures} compares confusion matrices for Wine (SL baseline vs.\ best RO, SA). The baseline concentrates predictions in the mid-quality classes (5--6), assigning zero predictions to extreme classes (quality 1, 2, 8). SA shifts predictions modestly, with the largest per-class gains at quality~2 ($+$0.15 F1) and quality~7 ($+$0.17 F1). Figure~\ref{fig:winepclass} shows the per-class F1 breakdown: SA improves the minority classes at the expense of small degradation in some majority classes, which is precisely the behavior expected from temperature-driven exploration that escapes local minima biased toward the majority class.
+
+\begin{figure*}[!htbp]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/confusion_wine.png}
+    \caption{Wine confusion matrices: SL baseline (left) vs.\ best RO, SA (right). Both models struggle with extreme quality levels (1, 8) due to severe class imbalance. SA shows improved recall for quality~2 and~7.}
+    \label{fig:confwine}
+\end{figure*}
+
+\begin{figure*}[!htbp]
+    \centering
+    \includegraphics[width=0.5\textwidth]{Figures/wine_perclass_f1.png}
+    \caption{Wine per-class F1: SL baseline vs.\ SA. SA improves quality~2 F1 by $+$0.15 and quality~7 by $+$0.17 while maintaining comparable performance on dominant classes.}
+    \label{fig:winepclass}
+\end{figure*}
+
+\section{Part 2: Adam Ablations (Adult)}
+
+\subsection{Setup}
+
+We train the full Adult backbone (all 61{,}401 parameters trainable) with seven optimizer configurations, keeping architecture, data splits, batch size (256), initialization, and random seeds fixed across all runs. Each optimizer is trained for up to 100 epochs with patience 15 on validation loss. SGD variants use learning rate 0.01 (matching the SL baseline); Adam variants use 0.001 (the standard default). We define a fixed validation-loss threshold $\ell = 0.3106$ (the 75th percentile of best validation losses across all optimizer--seed combinations) and measure how many epochs and how much wall-clock time each optimizer requires to first reach $\ell$.
+
+The seven optimizers are: (1)~SGD (no momentum); (2)~SGD with momentum $\mu = 0.9$; (3)~Nesterov accelerated gradient ($\mu = 0.9$); (4)~Adam ($\beta_1 = 0.9$, $\beta_2 = 0.999$); (5)~Adam without bias correction; (6)~Adam with $\beta_1 = 0$ (RMSProp-like, isolating adaptive scaling); (7)~AdamW (decoupled weight decay $\lambda = 0.01$).
+
+\subsection{Results}
+
+\textbf{Convergence speed.} Adam-family optimizers reached $\ell$ dramatically faster than SGD variants. Adam and AdamW crossed the threshold in a median of 4.4 epochs (0.77--0.80~s), while SGD with momentum required 19.4 epochs (3.10~s). Plain SGD never reached $\ell$ within 100 epochs, confirming that adaptive scaling and momentum together provide a substantial convergence advantage. Notably, Adam without bias correction was fastest (3.2 epochs, 0.57~s), suggesting that on this dataset and batch size, the early-epoch bias in the raw moment estimates is not harmful and may even provide a form of implicit warm-up.
+
+\textbf{Stability across seeds.} Figure~\ref{fig:stability} shows validation loss trajectories (median $\pm$ IQR across 5 seeds). Adam-family methods exhibit tight IQR bands, indicating low sensitivity to initialization. SGD+Momentum and Nesterov show moderate variance during the first 20 epochs before converging. Plain SGD has the narrowest bands but converges to a higher loss floor (0.3123 vs. 0.3078 for momentum variants), trading stability for a worse optimum.
+
+\begin{figure*}[!htbp]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/part2_stability_bands.png}
+    \caption{Stability bands (median $\pm$ IQR, 5 seeds) for validation loss vs.\ epoch (left) and wall-clock time (right). Each epoch comprises $\lfloor N_\mathrm{train}/256 \rfloor$ gradient evaluations (${\approx}120$). The dashed line marks the threshold $\ell = 0.3106$. Adam variants converge $\sim$4$\times$ faster in both epochs and wall-clock than SGD+Momentum.}
+    \label{fig:stability}
+\end{figure*}
+
+\textbf{Generalization gap.} Figure~\ref{fig:gengap} compares train, validation, and test accuracy across optimizers. All methods achieve similar test accuracy (0.8504--0.8525), with SGD+Momentum and Nesterov showing marginally higher test accuracy (0.8523--0.8525) than Adam (0.8514). The generalization gap (train $-$ test) is slightly larger for SGD+Momentum, suggesting that momentum's faster convergence does not come at the cost of overfitting on this dataset.
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/part2_gen_gap.png}
+    \caption{Train, validation, and test accuracy for all seven optimizers. Differences are small ($<$0.02), but SGD+Momentum and Nesterov achieve the highest test accuracy despite slower convergence. All optimizers exceed the SL baseline accuracy (0.8507).}
+    \label{fig:gengap}
+\end{figure}
+
+\textbf{Sensitivity heatmaps.} Figure~\ref{fig:heatmaps} shows best validation loss across learning rate and $\beta_1$ (left) and learning rate and $\beta_2$ (right). The $(\alpha, \beta_1)$ heatmap reveals that higher $\beta_1$ values (0.9--0.99) are moderately beneficial, especially at lower learning rates, confirming that momentum smoothing helps on this loss surface. The $(\alpha, \beta_2)$ heatmap shows that the best results occur at $\beta_2 \geq 0.999$ with $\alpha \leq 5 \times 10^{-4}$, and that smaller $\beta_2$ values (0.9) degrade performance by making the adaptive scaling too responsive to recent gradient magnitudes. Both heatmaps show that learning rates above 0.005 consistently produce worse results regardless of $\beta$ settings.
+
+\begin{figure*}[!htbp]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/part2_heatmaps.png}
+    \caption{Sensitivity heatmaps for Adam on Adult. Left: best validation loss over $(\alpha, \beta_1)$ with $\beta_2 = 0.999$. Right: best validation loss over $(\alpha, \beta_2)$ with $\beta_1 = 0.9$. Cooler colors indicate lower (better) loss.}
+    \label{fig:heatmaps}
+\end{figure*}
+
+\textbf{Summary.} Table~\ref{tab:part2} presents the complete results. Adam-family optimizers use $\sim$4$\times$ fewer gradient evaluations than SGD+Momentum for comparable final performance. SGD+Momentum achieves the best test F1 (0.6783), marginally above the SL baseline (0.6726), while Adam achieves the fastest convergence (2{,}565 gradient evaluations, 3.75~s).
+
+\begin{table}[!htbp]
+\centering
+\caption{Part 2 Summary: Adam Ablations on Adult Income}
+\label{tab:part2}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Optimizer} & \textbf{Best Val} & \textbf{Test} & \textbf{Test} & \textbf{Grad} & \textbf{To $\ell$} & \textbf{Wall} \\
+ & \textbf{Loss} & \textbf{Acc} & \textbf{F1} & \textbf{Evals} & \textbf{(ep)} & \textbf{(s)} \\
+\midrule
+SGD          & 0.3123 & 0.8505 & 0.6742 & 12{,}100 & --- & 15.4 \\
+SGD+Mom.     & 0.3078 & 0.8523 & 0.6783 & 8{,}349 & 19.4 & 10.5 \\
+Nesterov     & 0.3078 & 0.8525 & 0.6775 & 8{,}349 & 19.2 & 10.5 \\
+Adam         & 0.3094 & 0.8514 & 0.6677 & 2{,}565 & 4.4 & 3.7 \\
+Adam-NoBias  & 0.3099 & 0.8504 & 0.6699 & 2{,}347 & 3.2 & 0.6 \\
+Adam-$\beta_1$=0 & 0.3107 & 0.8516 & 0.6740 & 2{,}710 & 5.4 & 4.2 \\
+AdamW        & 0.3093 & 0.8514 & 0.6678 & 2{,}565 & 4.4 & 3.8 \\
+\midrule
+SL Baseline  & ---    & 0.8507 & 0.6726 & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Discussion}
+
+The ablation results partially support H2. As predicted, Adam converges dramatically faster than SGD, reducing gradient evaluations by $\sim$5$\times$. However, the hypothesis that momentum alone would close most of the gap was only partially confirmed: SGD+Momentum required $\sim$3$\times$ more evaluations than Adam, indicating that adaptive scaling (the second moment) provides a substantial additional benefit beyond what momentum offers.
+
+The most surprising finding is that Adam \textit{without} bias correction converged fastest (3.2 epochs vs. 4.4 for standard Adam). This suggests that on this dataset, the larger effective step size in the first few iterations---caused by dividing by raw, underestimated second-moment estimates---acts as a beneficial warm-up rather than a source of instability. This result is specific to the Adult dataset's relatively smooth loss surface; on noisier or higher-dimensional problems, bias correction may be more important.
+
+Removing $\beta_1$ entirely (Adam-$\beta_1 = 0$, RMSProp-like) slowed convergence by $\sim$2$\times$ compared to full Adam, confirming that first-moment smoothing is important. However, this variant still vastly outperformed plain SGD, demonstrating that adaptive scaling alone is a powerful training ingredient.
+
+From a computationally-aware perspective, Adam variants average $\sim$2{,}500 gradient evaluations in $\sim$3.7~s, while SGD requires 12{,}100 evaluations in 15.4~s. The per-iteration cost is approximately equal (both involve one forward-backward pass per batch), so the time difference is driven entirely by the number of epochs to convergence. AdamW adds negligible overhead vs.\ Adam because decoupled weight decay is a single subtraction per parameter after the Adam update step.
+
+Regarding generalization, H2's prediction that Adam would overfit more than SGD was \textit{not} confirmed. All optimizers achieved similar test accuracy (0.850--0.853), and SGD+Momentum actually produced the highest test F1 (0.6783) despite its slower convergence. The practical implication is that for this dataset, optimizer choice has a large effect on training \textit{speed} but a small effect on final generalization.
+
+\section{Part 3: Regularization Study (Adult)}
+
+\subsection{Setup}
+
+We fix the optimizer to standard Adam ($\alpha = 0.001$, $\beta_1 = 0.9$, $\beta_2 = 0.999$) and systematically vary four regularization techniques on the Adult backbone. The baseline uses the architecture's built-in 20\% dropout as the only regularization. We evaluate: (1)~\textbf{L2 weight decay} (coupled) at $\lambda \in \{10^{-5}, 10^{-4}, 10^{-3}, 10^{-2}\}$; (2)~\textbf{dropout} at rates $\{0.1, 0.3, 0.4, 0.5\}$; (3)~\textbf{early stopping} with patience $\{5, 10, 20, 30\}$; (4)~\textbf{noise regularization} combining label smoothing $\epsilon \in \{0.05, 0.1\}$ and input noise $\sigma \in \{0.01, 0.05\}$.
+
+Figure~\ref{fig:regsweep} shows test F1 across all configurations under identical compute budgets. The strongest single regularizer was the noise combination (label smoothing $\epsilon = 0.1$, input noise $\sigma = 0.05$) at F1 = 0.6788, followed by L2 with $\lambda = 10^{-3}$ at F1 = 0.6776. Both exceeded the SL baseline F1 of 0.6726.
+
+The best overall combination was L2 ($\lambda = 10^{-3}$) + dropout (0.4), achieving F1 = 0.6814 and accuracy 0.8530---the highest of any configuration in this report. Interestingly, combining all four techniques degraded performance (F1 = 0.6692), suggesting that excessive regularization constrains the model too much, underfitting the minority class.
+
+Early stopping showed no effect regardless of patience value, all producing identical results (F1 = 0.6677). This confirms that Adam converges quickly to a stable minimum on this dataset, and early stopping provides no additional benefit beyond what the baseline patience of 15 already delivers.
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/part3_reg_sweep.png}
+    \caption{Regularization sweep on Adult with fixed Adam optimizer. Bar colors group techniques: gray (baselines), blue (L2), orange (dropout), green (early stopping), purple (noise), red (combinations). The dashed line marks the SL baseline F1 (0.6726). The best combination (L2 + dropout) achieves F1 = 0.6814.}
+    \label{fig:regsweep}
+\end{figure}
+
+\subsection{Discussion}
+
+H3 is partially supported. Regularization did yield a larger test-F1 improvement than optimizer choice alone: the best regularized configuration (L2 + dropout, F1 = 0.6814) outperforms the best Part~2 optimizer (SGD+Momentum, F1 = 0.6783), confirming that for this dataset, tuning regularization is more impactful than tuning the optimizer.
+
+However, the specific predictions were only partially correct. Dropout was not the strongest individual regularizer---noise regularization (label smoothing + input noise) was. This makes sense mechanically: label smoothing softens the BCE target from hard 0/1 to $[0.05, 0.95]$, reducing the model's incentive to produce extreme logits for the imbalanced majority class. Input noise acts as a data augmentation, effectively increasing the training set diversity. We note that our input noise implementation adds a single static perturbation before training; per-epoch resampling would provide stronger regularization by preventing the model from memorizing the perturbed inputs.
+
+The L2 + dropout combination succeeded because these techniques regularize complementary aspects: L2 penalizes large weight magnitudes globally, while dropout disrupts co-adapted hidden-unit relationships locally. Together they produce a smoother loss landscape without excessively constraining capacity. Adding noise on top degraded the combination (F1 dropped from 0.6814 to 0.6692), indicating that three regularizers simultaneously over-constrain a two-hidden-layer network on this dataset.
+
+\textbf{Confusion matrices.} Figure~\ref{fig:confadult} compares Adult confusion matrices across all three Parts. The SL baseline (top-left) shows 741 false negatives ($>$50K predicted as $\leq$50K), the primary source of reduced F1. SGD+Momentum (top-right) reduces this to 725, and L2+Dropout (bottom-right) achieves the fewest false negatives (709), consistent with its highest F1 (0.6814). GA fine-tuning (bottom-left) slightly worsens false-negative count relative to the baseline, indicating that RO primarily adjusts the decision boundary orientation rather than improving minority-class recall.
+
+\begin{figure*}[!htbp]
+    \centering
+    \includegraphics[width=0.7\textwidth]{Figures/confusion_adult.png}
+    \caption{Adult confusion matrices: SL baseline (top-left), best optimizer SGD+Momentum (top-right), best RO GA (bottom-left), best regularization L2+Dropout (bottom-right). L2+Dropout achieves the fewest false negatives, consistent with its highest F1.}
+    \label{fig:confadult}
+\end{figure*}
+
+From a compute perspective, L2 with $\lambda = 10^{-3}$ required $\sim$3$\times$ more gradient evaluations (7{,}454 vs.\ 2{,}565 baseline) because the regularization term slows convergence, requiring more epochs. The best combination used 6{,}655 evaluations---still far fewer than SGD's 12{,}100 in Part~2.
+
+% ============================================================
+\section{Part 4: Integrated Best Combination (EC)}
+
+\subsection{Setup}
+
+We compose the best elements from Parts 1--3 into a single training recipe: Adam ($\alpha = 0.001$, $\beta_1 = 0.9$, $\beta_2 = 0.999$) with L2 weight decay ($\lambda = 10^{-3}$) and dropout (0.4) from Part~3, followed by GA fine-tuning on the last two layers (40{,}401 trainable parameters) with a budget of 200 function evaluations (10\% of Part~1). GA uses population 10, tournament selection ($k=3$), crossover rate 0.7, mutation rate 0.1 ($\sigma = 0.01$), and elitism 2. Five seeds are used for stability.
+
+\subsection{Results and Discussion}
+
+The integrated recipe achieved a pre-RO median test F1 of 0.6825 (IQR: 0.6789--0.6834), already exceeding both the SL baseline (0.6726) and the Part~3 best (0.6814). However, GA fine-tuning \textit{degraded} performance to a median F1 of 0.6795 (IQR: 0.6770--0.6800), a median decrease of $-$0.0011. Only 2 of 5 seeds showed improvement ($+$0.0006, $+$0.0014), while the remaining 3 seeds worsened by up to $-$0.0075.
+
+This negative result is informative: the Adam + L2 + dropout recipe already converges to a well-regularized minimum, and GA's random perturbations displace the weights from this basin without finding a better one within the 200-evaluation budget. The total compute cost was 6{,}655 gradient evaluations $+$ 200 function evaluations ($\sim$11.4~s), making the RO step a poor investment.
+
+\textbf{Hypothesis resolution.} The composition does not improve over the best individual parts. The practitioner's optimal recipe for Adult remains Adam + L2($10^{-3}$) + Dropout(0.4) \textit{without} RO fine-tuning, achieving F1 = 0.6825 (median across seeds), a $+$1.5\% improvement over the SL baseline.
+
+% ============================================================
+
+\section{Conclusion}
+
+This report investigated three levers for improving neural network training on the Adult and Wine classification tasks: randomized optimization, optimizer design and regularization.
+
+\textbf{Decision rule for Adult.} When the model underperforms, the practitioner should (1)~first try regularization---specifically L2 weight decay ($\lambda = 10^{-3}$) combined with dropout (0.4), which produced the highest F1 (0.6814) and required only $\sim$6{,}600 gradient evaluations; (2)~then consider optimizer choice, where SGD+Momentum achieved comparable F1 (0.6783) but at $\sim$3$\times$ the compute cost of Adam; (3)~apply RO fine-tuning last, as it provided marginal gains ($+$0.5\% F1) at the cost of additional function evaluations.
+
+\textbf{Hypothesis resolution.} H1 (RO) was partially refuted: GA and SA did produce improvements over the SL baseline on both datasets, with SA on Wine showing a $+$10\% Macro-F1 gain. H2 (optimizer ablation) was partially confirmed: Adam converges $\sim$5$\times$ faster than SGD, and removing bias correction did not harm performance. However, Adam's generalization was not worse than SGD's, contrary to our prediction. H3 (regularization) was partially supported: regularization did outperform optimizer tuning, but dropout was not the strongest individual regularizer---noise regularization was.
+
+\textbf{Comparison to SL baseline.} The best configuration from this report (Adam + L2 + dropout) improves Adult test F1 from 0.6726 (SL baseline) to 0.6825 (median, $+$1.5\%), while Wine SA improves Macro-F1 from 0.3085 to 0.3395 ($+$10.0\%). Composing all three elements (Part~4, EC) did not yield further gains, confirming that the Adam + regularization recipe is already near-optimal for this architecture and dataset.
+
+% ============================================================
+\section*{Summary Table}
+
+\begin{table}[!htbp]
+\centering
+\caption{Cross-Part Summary for Adult Income}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{Best Val} & \textbf{Test} & \textbf{To $\ell$} & \textbf{Grad} & \textbf{Func} & \textbf{Wall} \\
+ & \textbf{Loss} & \textbf{F1} & \textbf{(ep)} & \textbf{Evals} & \textbf{Evals} & \textbf{(s)} \\
+\midrule
+SL Baseline (SGD) & --- & 0.6726 & --- & --- & --- & --- \\
+\midrule
+\multicolumn{7}{l}{\textit{Part 1: Randomized Optimization}} \\
+RHC & 0.3018 & 0.6732 & --- & --- & 2{,}000 & 5.0 \\
+SA & 0.3006 & 0.6677 & --- & --- & 2{,}000 & 4.9 \\
+GA & 0.3081 & 0.6758 & --- & --- & 2{,}000 & 4.8 \\
+\midrule
+\multicolumn{7}{l}{\textit{Part 2: Optimizer Ablations}} \\
+SGD & 0.3123 & 0.6742 & --- & 12{,}100 & --- & 15.4 \\
+SGD+Momentum & 0.3078 & 0.6783 & 19.4 & 8{,}349 & --- & 10.5 \\
+Adam & 0.3094 & 0.6677 & 4.4 & 2{,}565 & --- & 3.7 \\
+AdamW & 0.3093 & 0.6678 & 4.4 & 2{,}565 & --- & 3.8 \\
+\midrule
+\multicolumn{7}{l}{\textit{Part 3: Regularization (Adam)}} \\
+L2 ($\lambda{=}10^{-3}$) & 0.3070 & 0.6776 & --- & 7{,}454 & --- & 10.9 \\
+Noise (LS+IN) & 0.3085 & 0.6788 & --- & 3{,}340 & --- & 5.1 \\
+L2+Dropout (best) & \textbf{0.3072} & \textbf{0.6814} & --- & 6{,}655 & --- & 16.0 \\
+\midrule
+\multicolumn{7}{l}{\textit{Part 4: Integrated (EC)}} \\
+Adam+L2+Drop+GA & 0.3072 & 0.6795 & --- & 6{,}655 & 200 & 11.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\caption{Part 1 Summary for Wine Quality}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{Best Val} & \textbf{Test} & \textbf{Test} & \textbf{Func} & \textbf{Wall} \\
+ & \textbf{Loss} & \textbf{Acc} & \textbf{Macro-F1} & \textbf{Evals} & \textbf{(s)} \\
+\midrule
+SL Baseline (SGD) & --- & 0.5646 & 0.3198 & --- & --- \\
+\midrule
+RHC & 0.9983 & 0.5500 & 0.3276 & 2{,}000 & 0.7 \\
+SA & 1.0215 & 0.5531 & \textbf{0.3395} & 2{,}000 & 0.7 \\
+GA & 1.0483 & 0.5533 & 0.3230 & 2{,}000 & 0.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section*{AI Use Statement}
+
+I used GitHub Copilot CLI to brainstorm and outline sections of the report, generate and refactor code for optimizer implementations and plotting, debug data-loading issues, and edit grammar and clarity throughout. I reviewed, verified, and understand all assisted content.
+
+% ============================================================
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
